@@ -10,6 +10,28 @@ var DITHERXYR = {
   DIFFUSETRANSF_270CW: null,
 
   // structs
+  Struct_Palette() {
+    return {
+      values: null,
+      count: null,
+
+      paletteMax: null,
+    };
+  },
+
+  Struct_CompiledPalette() {
+    return {
+      values: null,
+      count: null,
+
+      paletteMax: null,
+
+      // optimization
+      invRanges: null,
+      lookup: null,
+    };
+  },
+
   Struct_Matrix() {
     return {
       matrix: null,
@@ -40,7 +62,9 @@ var DITHERXYR = {
 
   Struct_CompiledClassMap() {
     return {
+      // keep original class map
       classMap: null,
+
       compiledClassMap: null,
       kernelTransform: null,
       classCount: null,
@@ -55,7 +79,10 @@ var DITHERXYR = {
       weights: [],
       division: null,
 
+      // x, y
       center: new Int32Array(2),
+
+      // width, height
       dimension: new Int32Array(2),
     };
   },
@@ -75,9 +102,9 @@ var DITHERXYR = {
   offsetOut: 0,
   strideOut: 1,
 
-  ProcessOrderedDitherMatrix() { },
+  CompileOrderedDitherMatrix() { },
   CompileDiffuseKernel() { },
-  CompileClassMatrix() { },
+  CompileClassMap() { },
 
   SetvalueLimits() { },
 
@@ -99,17 +126,39 @@ DITHERXYR.DIFFUSETRANSF_90CW = 1 << 2;
 DITHERXYR.DIFFUSETRANSF_180 = DITHERXYR.DIFFUSETRANSF_FLIPX | DITHERXYR.DIFFUSETRANSF_FLIPY;
 DITHERXYR.DIFFUSETRANSF_270CW = DITHERXYR.DIFFUSETRANSF_FLIPX | DITHERXYR.DIFFUSETRANSF_FLIPY | DITHERXYR.DIFFUSETRANSF_90CW;
 
-DITHERXYR.ProcessOrderedDitherMatrix = function (matrix, compiledMatrix) {
+DITHERXYR.CompilePalette = function (palette, compiledPalette) {
+  const values = palette.values;
+  const count = palette.count;
+  const paletteMax = palette.paletteMax;
+
+  compiledPalette.count = count;
+  compiledPalette.paletteMax = paletteMax;
+  compiledPalette.values.set(values);
+
+  for (let i = 0; i < count - 1; i++)
+    compiledPalette.invRanges[i] = 1 / (values[i + 1] - values[i]);
+
+  const lastInterval = count - 2;
+
+  for (let i = 0, j = 0; i <= paletteMax; i++) {
+    while (j < lastInterval && i >= values[j + 1])
+      j++;
+
+    compiledPalette.lookup[i] = j;
+  }
+};
+
+DITHERXYR.CompileOrderedDitherMatrix = function (matrix, compiledMatrix) {
   const size = matrix.width * matrix.height;
 
   const invMax = 1 / matrix.division;
-  for (let i = 0; i < size; i++) compiledMatrix.matrix[i] = matrix.matrix[i] * invMax;
+  for (let i = 0; i < size; i++) compiledMatrix.matrix[i] = (matrix.matrix[i] + 0.5) * invMax;
 
   compiledMatrix.width = matrix.width;
   compiledMatrix.height = matrix.height;
 };
 
-DITHERXYR.CompileClassMatrix = function (classMap, compiledClassMap) {
+DITHERXYR.CompileClassMap = function (classMap, compiledClassMap) {
   compiledClassMap.width = classMap.width;
   compiledClassMap.height = classMap.height;
 
@@ -159,26 +208,36 @@ DITHERXYR.CompileDiffuseKernel = function (diffuseKernelList, kernelCount, compi
   }
 };
 
-DITHERXYR.DitherOrdered = function (buffer, out, width, height, compiledMatrix, normalizeValue, rescaleValue) {
+DITHERXYR.DitherOrdered = function (buffer, out, width, height, compiledMatrix, compiledPalette) {
   for (let y = 0, matrixY = 0; y < height; y++, matrixY++) {
     if (matrixY === compiledMatrix.height) matrixY = 0;
-
-    const row = y * width;
     const matrixRow = matrixY * compiledMatrix.width;
 
+    const row = y * width;
+
     for (let x = 0, matrixX = 0; x < width; x++, matrixX++) {
+      if (matrixX === compiledMatrix.width) matrixX = 0;
+
       const idx = row + x;
       const idxIn = idx * DITHERXYR.strideIn + DITHERXYR.offsetIn;
       const idxOut = idx * DITHERXYR.strideOut + DITHERXYR.offsetOut;
 
-      if (matrixX === compiledMatrix.width) matrixX = 0;
+      const value = buffer[idxIn];
 
-      out[idxOut] = Math.floor(buffer[idxIn] * normalizeValue + compiledMatrix.matrix[matrixRow + matrixX]) * rescaleValue;
+      const intervalIdx = compiledPalette.lookup[value];
+      const lower = compiledPalette.values[intervalIdx];
+      const upper = compiledPalette.values[intervalIdx + 1];
+
+      const t = (value - lower) * compiledPalette.invRanges[intervalIdx];
+
+      out[idxOut] =
+        (t > compiledMatrix.matrix[matrixRow + matrixX]) ?
+          upper : lower;
     }
   }
 };
 
-DITHERXYR.DitherArithmetic = function (buffer, out, width, height, arithFn, normalizeValue, rescaleValue) {
+DITHERXYR.DitherArithmetic = function (buffer, out, width, height, arithFn, compiledPalette) {
   for (let y = 0; y < height; y++) {
     const row = y * width;
 
@@ -187,9 +246,15 @@ DITHERXYR.DitherArithmetic = function (buffer, out, width, height, arithFn, norm
       const idxIn = idx * DITHERXYR.strideIn + DITHERXYR.offsetIn;
       const idxOut = idx * DITHERXYR.strideOut + DITHERXYR.offsetOut;
 
-      const v = buffer[idxIn];
+      const value = buffer[idxIn];
 
-      out[idxOut] = Math.floor(v * normalizeValue + arithFn(x, y, v)) * rescaleValue;
+      const intervalIdx = compiledPalette.lookup[value];
+      const lower = compiledPalette.values[intervalIdx];
+      const upper = compiledPalette.values[intervalIdx + 1];
+
+      const t = (value - lower) * compiledPalette.invRanges[intervalIdx];
+
+      out[idxOut] = (t > arithFn(x, y, value)) ? upper : lower;
     }
   }
 };
@@ -200,7 +265,7 @@ DITHERXYR.CreateDitherErrorDiffusion = function (DIRECT_ERROR_PROGPAGATION, ALLO
     compiledDiffuseKernelList,
     compiledClassMap,
     tileCountX, tileCountY,
-    normalizeValue, rescaleValue, paletteValueCount) {
+    compiledPalette) {
 
     let targetBuffer;
     if (!DIRECT_ERROR_PROGPAGATION) targetBuffer = errorBuffer;
@@ -224,12 +289,18 @@ DITHERXYR.CreateDitherErrorDiffusion = function (DIRECT_ERROR_PROGPAGATION, ALLO
           const idxIn = idx * DITHERXYR.strideIn + DITHERXYR.offsetIn;
           const idxOut = idx * DITHERXYR.strideOut + DITHERXYR.offsetOut;
 
-          const pixel = buffer[idxIn];
-          let pixelWError = pixel;
-          if (!DIRECT_ERROR_PROGPAGATION) pixelWError += errorBuffer[idx];
+          const value = buffer[idxIn];
+          let valueWithError = value;
+          if (!DIRECT_ERROR_PROGPAGATION) valueWithError += errorBuffer[idx];
 
-          const result = Math.round(pixelWError * normalizeValue) * rescaleValue;
-          let error = pixelWError - result;
+          const intervalIdx = compiledPalette.lookup[value];
+          const lower = compiledPalette.values[intervalIdx];
+          const upper = compiledPalette.values[intervalIdx + 1];
+
+          const t = (valueWithError - lower) * compiledPalette.invRanges[intervalIdx];
+
+          const result = (t < 0.5) ? lower : upper;
+          let error = valueWithError - result;
 
           out[idxOut] = result;
 
@@ -237,9 +308,9 @@ DITHERXYR.CreateDitherErrorDiffusion = function (DIRECT_ERROR_PROGPAGATION, ALLO
 
           let cacheCount = 0;
 
-          let kernelIdx = Math.floor(pixel);
+          let kernelIdx = Math.floor(value);
           if (kernelIdx < 0) kernelIdx = 0;
-          else if (kernelIdx >= paletteValueCount) kernelIdx = paletteValueCount - 1;
+          else if (kernelIdx >= compiledPalette.paletteMax) kernelIdx = compiledPalette.paletteMax - 1;
 
           const currentKernel = compiledDiffuseKernelList[kernelIdx];
 
